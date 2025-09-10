@@ -10,16 +10,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: fetch upstream
-        uses: tgymnich/fork-sync@v2.0
+      - uses: tgymnich/fork-sync@v2.0
         with:
           token: ${{ secrets.PERSONAL_TOKEN }}
           owner: EasyTier
           base: main
           head: main
-          auto_approve: true
-          # github_token: ${{ secrets.GITHUB_TOKEN }}
-          # personal_token: ${{ secrets.PERSONAL_TOKEN }}
 
       - name: Delete workflow runs
         uses: Mattraks/delete-workflow-runs@v2
