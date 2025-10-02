@@ -1,4 +1,5 @@
 use std::collections::hash_map::DefaultHasher;
+use std::net::IpAddr;
 use std::{
     hash::Hasher,
     sync::{Arc, Mutex},
@@ -9,7 +10,8 @@ use crate::common::stats_manager::StatsManager;
 use crate::common::token_bucket::TokenBucketManager;
 use crate::peers::acl_filter::AclFilter;
 use crate::proto::acl::GroupIdentity;
-use crate::proto::cli::PeerConnInfo;
+use crate::proto::api::config::InstanceConfigPatch;
+use crate::proto::api::instance::PeerConnInfo;
 use crate::proto::common::{PeerFeatureFlag, PortForwardConfigPb};
 use crate::proto::peer_rpc::PeerGroupInfo;
 use crossbeam::atomic::AtomicCell;
@@ -43,13 +45,16 @@ pub enum GlobalCtxEvent {
     Connecting(url::Url),
     ConnectError(String, String, String), // (dst, ip version, error message)
 
-    VpnPortalClientConnected(String, String), // (portal, client ip)
+    VpnPortalStarted(String),                    // (portal)
+    VpnPortalClientConnected(String, String),    // (portal, client ip)
     VpnPortalClientDisconnected(String, String), // (portal, client ip)
 
     DhcpIpv4Changed(Option<cidr::Ipv4Inet>, Option<cidr::Ipv4Inet>), // (old, new)
     DhcpIpv4Conflicted(Option<cidr::Ipv4Inet>),
 
     PortForwardAdded(PortForwardConfigPb),
+
+    ConfigPatched(InstanceConfigPatch),
 }
 
 pub type EventBus = tokio::sync::broadcast::Sender<GlobalCtxEvent>;
@@ -119,13 +124,13 @@ impl GlobalCtx {
         if let Some(stun_servers) = config_fs.get_stun_servers() {
             stun_info_collector.set_stun_servers(stun_servers);
         } else {
-            stun_info_collector.set_stun_servers(Vec::new());
+            stun_info_collector.set_stun_servers(StunInfoCollector::get_default_servers());
         }
 
         if let Some(stun_servers) = config_fs.get_stun_servers_v6() {
             stun_info_collector.set_stun_servers_v6(stun_servers);
         } else {
-            stun_info_collector.set_stun_servers_v6(Vec::new());
+            stun_info_collector.set_stun_servers_v6(StunInfoCollector::get_default_servers_v6());
         }
 
         let stun_info_collector = Arc::new(stun_info_collector);
@@ -237,6 +242,13 @@ impl GlobalCtx {
 
     pub fn get_id(&self) -> uuid::Uuid {
         self.config.get_id()
+    }
+
+    pub fn is_ip_in_same_network(&self, ip: &IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(v4) => self.get_ipv4().map(|x| x.contains(v4)).unwrap_or(false),
+            IpAddr::V6(v6) => self.get_ipv6().map(|x| x.contains(v6)).unwrap_or(false),
+        }
     }
 
     pub fn get_network_identity(&self) -> NetworkIdentity {

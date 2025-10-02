@@ -9,7 +9,8 @@ use crate::{
         scoped_task::ScopedTask,
     },
     launcher::{ConfigSource, NetworkInstance, NetworkInstanceRunningInfo},
-    proto,
+    proto::{self},
+    rpc_service::InstanceRpcService,
 };
 
 pub struct NetworkInstanceManager {
@@ -150,6 +151,26 @@ impl NetworkInstanceManager {
             .map(|instance| instance.value().get_inst_name())
     }
 
+    pub fn filter_network_instance(
+        &self,
+        filter: impl Fn(&uuid::Uuid, &NetworkInstance) -> bool,
+    ) -> Vec<uuid::Uuid> {
+        self.instance_map
+            .iter()
+            .filter(|item| filter(item.key(), item.value()))
+            .map(|item| *item.key())
+            .collect()
+    }
+
+    pub fn get_instance_service(
+        &self,
+        instance_id: &uuid::Uuid,
+    ) -> Option<Arc<dyn InstanceRpcService>> {
+        self.instance_map
+            .get(instance_id)
+            .and_then(|instance| instance.value().get_api_service())
+    }
+
     pub fn set_tun_fd(&self, instance_id: &uuid::Uuid, fd: i32) -> Result<(), anyhow::Error> {
         let mut instance = self
             .instance_map
@@ -270,6 +291,13 @@ fn handle_event(
                         );
                     }
 
+                    GlobalCtxEvent::VpnPortalStarted(portal) => {
+                        print_event(
+                            instance_id,
+                            format!("vpn portal started. portal: {}", portal),
+                        );
+                    }
+
                     GlobalCtxEvent::VpnPortalClientConnected(portal, client_addr) => {
                         print_event(
                             instance_id,
@@ -312,6 +340,10 @@ fn handle_event(
                             ),
                         );
                     }
+
+                    GlobalCtxEvent::ConfigPatched(patch) => {
+                        print_event(instance_id, format!("config patched. patch: {:?}", patch));
+                    }
                 }
             } else {
                 events = events.resubscribe();
@@ -329,7 +361,7 @@ fn print_event(instance_id: uuid::Uuid, msg: String) {
     );
 }
 
-fn peer_conn_info_to_string(p: proto::cli::PeerConnInfo) -> String {
+fn peer_conn_info_to_string(p: proto::api::instance::PeerConnInfo) -> String {
     format!(
         "my_peer_id: {}, dst_peer_id: {}, tunnel_info: {:?}",
         p.my_peer_id, p.peer_id, p.tunnel

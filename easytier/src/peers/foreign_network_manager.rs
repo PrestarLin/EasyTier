@@ -32,7 +32,7 @@ use crate::{
     peer_center::instance::{PeerCenterInstance, PeerMapWithPeerRpcManager},
     peers::route_trait::{Route, RouteInterface},
     proto::{
-        cli::{ForeignNetworkEntryPb, ListForeignNetworkResponse, PeerInfo},
+        api::instance::{ForeignNetworkEntryPb, ListForeignNetworkResponse, PeerInfo},
         common::LimiterConfig,
         peer_rpc::DirectConnectorRpcServer,
     },
@@ -170,6 +170,8 @@ impl ForeignNetworkEntry {
         let mut flags = config.get_flags();
         flags.disable_relay_kcp = !global_ctx.get_flags().enable_relay_foreign_network_kcp;
         config.set_flags(flags);
+
+        config.set_mapped_listeners(Some(global_ctx.config.get_mapped_listeners()));
 
         let foreign_global_ctx = Arc::new(GlobalCtx::new(config));
         foreign_global_ctx

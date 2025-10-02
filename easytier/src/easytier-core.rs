@@ -13,7 +13,6 @@ use std::{
 use anyhow::Context;
 use cidr::IpCidr;
 use clap::{CommandFactory, Parser};
-
 use clap_complete::Shell;
 use easytier::{
     common::{
@@ -25,16 +24,18 @@ use easytier::{
         constants::EASYTIER_VERSION,
         global_ctx::GlobalCtx,
         set_default_machine_id,
-        stun::{MockStunInfoCollector, StunInfoCollector},
+        stun::MockStunInfoCollector,
     },
     connector::create_connector_by_url,
     instance_manager::NetworkInstanceManager,
     launcher::{add_proxy_network_to_config, ConfigSource},
     proto::common::{CompressionAlgoPb, NatType},
+    rpc_service::ApiRpcServer,
     tunnel::{IpVersion, PROTO_PORT_OFFSET},
     utils::{init_logger, setup_panic_handler},
     web_client,
 };
+use tokio::io::AsyncReadExt;
 
 #[cfg(target_os = "windows")]
 windows_service::define_windows_service!(ffi_service_main, win_service_main);
@@ -130,8 +131,14 @@ struct Cli {
     #[command(flatten)]
     logging_options: LoggingOptions,
 
+    #[command(flatten)]
+    rpc_portal_options: RpcPortalOptions,
+
     #[clap(long, help = t!("core_clap.generate_completions").to_string())]
     gen_autocomplete: Option<Shell>,
+
+    #[clap(long, help = t!("core_clap.check_config").to_string())]
+    check_config: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -201,22 +208,6 @@ struct NetworkOptions {
         help = t!("core_clap.proxy_networks").to_string()
     )]
     proxy_networks: Vec<String>,
-
-    #[arg(
-        short,
-        long,
-        env = "ET_RPC_PORTAL",
-        help = t!("core_clap.rpc_portal").to_string(),
-    )]
-    rpc_portal: Option<String>,
-
-    #[arg(
-        long,
-        env = "ET_RPC_PORTAL_WHITELIST",
-        value_delimiter = ',',
-        help = t!("core_clap.rpc_portal_whitelist").to_string(),
-    )]
-    rpc_portal_whitelist: Option<Vec<IpCidr>>,
 
     #[arg(
         short,
@@ -605,6 +596,39 @@ struct LoggingOptions {
         help = t!("core_clap.file_log_dir").to_string()
     )]
     file_log_dir: Option<String>,
+
+    #[arg(
+        long,
+        env = "ET_FILE_LOG_SIZE",
+        help = t!("core_clap.file_log_size_mb").to_string()
+    )]
+    file_log_size: Option<u64>,
+
+    #[arg(
+        long,
+        env = "ET_FILE_LOG_COUNT",
+        help = t!("core_clap.file_log_count").to_string()
+    )]
+    file_log_count: Option<usize>,
+}
+
+#[derive(Parser, Debug)]
+struct RpcPortalOptions {
+    #[arg(
+        short,
+        long,
+        env = "ET_RPC_PORTAL",
+        help = t!("core_clap.rpc_portal").to_string(),
+    )]
+    rpc_portal: Option<String>,
+
+    #[arg(
+        long,
+        env = "ET_RPC_PORTAL_WHITELIST",
+        value_delimiter = ',',
+        help = t!("core_clap.rpc_portal_whitelist").to_string(),
+    )]
+    rpc_portal_whitelist: Option<Vec<IpCidr>>,
 }
 
 rust_i18n::i18n!("locales", fallback = "en");
@@ -653,14 +677,6 @@ impl Cli {
         }
 
         Ok(listeners)
-    }
-
-    fn parse_rpc_portal(rpc_portal: String) -> anyhow::Result<SocketAddr> {
-        if let Ok(port) = rpc_portal.parse::<u16>() {
-            return Ok(format!("0.0.0.0:{}", port).parse().unwrap());
-        }
-
-        Ok(rpc_portal.parse()?)
     }
 }
 
@@ -767,24 +783,6 @@ impl NetworkOptions {
 
         for n in self.proxy_networks.iter() {
             add_proxy_network_to_config(n, cfg)?;
-        }
-
-        let rpc_portal = if let Some(r) = &self.rpc_portal {
-            Cli::parse_rpc_portal(r.clone())
-                .with_context(|| format!("failed to parse rpc portal: {}", r))?
-        } else if let Some(r) = cfg.get_rpc_portal() {
-            r
-        } else {
-            Cli::parse_rpc_portal("0".into())?
-        };
-        cfg.set_rpc_portal(rpc_portal);
-
-        if let Some(rpc_portal_whitelist) = &self.rpc_portal_whitelist {
-            let mut whitelist = cfg.get_rpc_portal_whitelist().unwrap_or_default();
-            for cidr in rpc_portal_whitelist {
-                whitelist.push(*cidr);
-            }
-            cfg.set_rpc_portal_whitelist(Some(whitelist));
         }
 
         if let Some(external_nodes) = self.external_node.as_ref() {
@@ -952,25 +950,16 @@ impl NetworkOptions {
         cfg.set_udp_whitelist(old_udp_whitelist);
 
         if let Some(stun_servers) = &self.stun_servers {
-            if stun_servers.is_empty() {
-                cfg.set_stun_servers(None);
-            } else {
-                cfg.set_stun_servers(Some(stun_servers.clone()));
-            }
-        } else {
-            cfg.set_stun_servers(Some(StunInfoCollector::get_default_servers()));
+            let mut old_stun_servers = cfg.get_stun_servers().unwrap_or_default();
+            old_stun_servers.extend(stun_servers.iter().cloned());
+            cfg.set_stun_servers(Some(old_stun_servers));
         }
 
-        if let Some(stun_servers) = &self.stun_servers_v6 {
-            if stun_servers.is_empty() {
-                cfg.set_stun_servers_v6(None);
-            } else {
-                cfg.set_stun_servers_v6(Some(stun_servers.clone()));
-            }
-        } else {
-            cfg.set_stun_servers_v6(Some(StunInfoCollector::get_default_servers_v6()));
+        if let Some(stun_servers_v6) = &self.stun_servers_v6 {
+            let mut old_stun_servers_v6 = cfg.get_stun_servers_v6().unwrap_or_default();
+            old_stun_servers_v6.extend(stun_servers_v6.iter().cloned());
+            cfg.set_stun_servers_v6(Some(old_stun_servers_v6));
         }
-
         Ok(())
     }
 }
@@ -987,6 +976,8 @@ impl LoggingConfigLoader for &LoggingOptions {
             level: self.file_log_level.clone(),
             dir: self.file_log_dir.clone(),
             file: None,
+            size_mb: self.file_log_size,
+            count: self.file_log_count,
         }
     }
 }
@@ -1115,7 +1106,17 @@ fn win_service_main(arg: Vec<std::ffi::OsString>) {
 }
 
 async fn run_main(cli: Cli) -> anyhow::Result<()> {
-    init_logger(&cli.logging_options, false)?;
+    init_logger(&cli.logging_options, true)?;
+
+    let manager = Arc::new(NetworkInstanceManager::new());
+
+    let _rpc_server = ApiRpcServer::new(
+        cli.rpc_portal_options.rpc_portal,
+        cli.rpc_portal_options.rpc_portal_whitelist,
+        manager.clone(),
+    )?
+    .serve()
+    .await?;
 
     if cli.config_server.is_some() {
         set_default_machine_id(cli.machine_id);
@@ -1165,18 +1166,25 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
             create_connector_by_url(c_url.as_str(), &global_ctx, IpVersion::Both).await?,
             token.to_string(),
             hostname,
+            manager,
         );
         tokio::signal::ctrl_c().await.unwrap();
         return Ok(());
     }
-    let manager = NetworkInstanceManager::new();
     let mut crate_cli_network =
         cli.config_file.is_none() || cli.network_options.network_name.is_some();
     if let Some(config_files) = cli.config_file {
         let config_file_count = config_files.len();
         for config_file in config_files {
-            let mut cfg = TomlConfigLoader::new(&config_file)
-                .with_context(|| format!("failed to load config file: {:?}", config_file))?;
+            let mut cfg = if config_file == PathBuf::from("-") {
+                let mut stdin = String::new();
+                _ = tokio::io::stdin().read_to_string(&mut stdin).await?;
+                TomlConfigLoader::new_from_str(stdin.as_str())
+                    .with_context(|| "failed to load config from stdin")?
+            } else {
+                TomlConfigLoader::new(&config_file)
+                    .with_context(|| format!("failed to load config file: {:?}", config_file))?
+            };
 
             if cli.network_options.can_merge(&cfg, config_file_count) {
                 cli.network_options.merge_into(&mut cfg).with_context(|| {
@@ -1298,6 +1306,17 @@ async fn main() -> ExitCode {
         easytier::print_completions(shell, &mut cmd, "easytier-core");
         return ExitCode::SUCCESS;
     }
+
+    // Verify configurations
+    if cli.check_config {
+        if let Err(e) = validate_config(&cli).await {
+            eprintln!("Config validation failed: {:?}", e);
+            return ExitCode::FAILURE;
+        } else {
+            return ExitCode::SUCCESS;
+        }
+    }
+
     let mut ret_code = 0;
 
     if let Err(e) = run_main(cli).await {
@@ -1311,4 +1330,26 @@ async fn main() -> ExitCode {
     set_prof_active(false);
 
     ExitCode::from(ret_code)
+}
+
+async fn validate_config(cli: &Cli) -> anyhow::Result<()> {
+    // Check if config file is provided
+    let config_files = cli
+        .config_file
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("--config-file is required when using --check-config"))?;
+
+    for config_file in config_files {
+        if config_file == &PathBuf::from("-") {
+            let mut stdin = String::new();
+            _ = tokio::io::stdin().read_to_string(&mut stdin).await?;
+            TomlConfigLoader::new_from_str(stdin.as_str())
+                .with_context(|| "config source: stdin")?;
+        } else {
+            TomlConfigLoader::new(config_file)
+                .with_context(|| format!("config source: {:?}", config_file))?;
+        };
+    }
+
+    Ok(())
 }
